@@ -1,0 +1,7 @@
+Model,Accuracy,Balanced Accuracy,Macro Precision,Macro Recall,Macro F1
+Logistic Regression,0.484,0.503,0.373,0.503,0.366
+Decision Tree,0.469,0.43,0.392,0.43,0.365
+Random Forest,0.547,0.391,0.393,0.391,0.384
+Gradient Boosting,0.516,0.376,0.345,0.376,0.339
+Tuned Random Forest,0.539,0.579,,0.579,0.45
+Voting Classifier,0.57,0.495,,0.495,0.457

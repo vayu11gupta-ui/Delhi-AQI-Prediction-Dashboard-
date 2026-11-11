@@ -1,0 +1,8 @@
+Model,MAE,RMSE,R2
+Baseline,149.765195,166.969933,-0.278946
+Linear Regression,82.022,104.4,0.5
+Decision Tree,80.255,107.816,0.467
+Random Forest,74.951,93.843,0.596
+Gradient Boosting,76.387,96.014,0.577
+Tuned Random Forest,73.947,94.165,0.593
+Voting Regressor,70.92,92.68,0.606
