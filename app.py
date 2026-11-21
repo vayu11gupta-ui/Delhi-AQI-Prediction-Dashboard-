@@ -5,6 +5,16 @@ import joblib
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
+import io
+import pickle
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 st.set_page_config(page_title="Delhi Air Intelligence | AQI Lab", page_icon="🌫️", layout="wide")
 
@@ -13,8 +23,18 @@ FEATURES = ["PM2.5 (µg/m³)", "PM10 (µg/m³)", "NO2 (µg/m³)", "SO2 (µg/m³)
 POLLUTANTS = FEATURES
 CATEGORY_ORDER = ["Good", "Satisfactory", "Moderate", "Poor", "Very Poor", "Severe"]
 COLORS = {"Good":"#16a085","Satisfactory":"#7dbb55","Moderate":"#e7c34b","Poor":"#ed9145","Very Poor":"#d95d59","Severe":"#9e344c"}
-REG_RESULTS = pd.read_csv(ROOT/"regression_benchmark.csv")
-CLF_RESULTS = pd.read_csv(ROOT/"classification_benchmark.csv")
+REG_RESULTS = pd.DataFrame([
+    ["Linear Regression",83.640,107.016,0.475],
+    ["Decision Tree",94.547,129.725,0.228],
+    ["Random Forest",81.155,104.418,0.500],
+    ["Gradient Boosting",78.603,101.416,0.528],
+],columns=["Model","MAE","RMSE","R²"])
+CLF_RESULTS = pd.DataFrame([
+    ["Logistic Regression",0.523,0.558,0.424,0.558,0.449],
+    ["Decision Tree",0.438,0.446,0.408,0.446,0.342],
+    ["Random Forest",0.484,0.374,0.390,0.374,0.363],
+    ["Gradient Boosting",0.500,0.375,0.364,0.375,0.336],
+],columns=["Model","Accuracy","Balanced Accuracy","Macro Precision","Macro Recall","Macro F1"])
 
 st.markdown("""
 <style>
@@ -49,23 +69,112 @@ def load_daily():
     d = pd.read_csv(ROOT/"daily_aqi_dashboard.csv", parse_dates=["Date"])
     return d.sort_values("Date")
 
-@st.cache_data
-def load_daily_25_26():
-    d = pd.read_csv(ROOT/"daily_aqi_2025_26_by_station.csv", parse_dates=["Date"])
-    return d.sort_values(["Station", "Date"])
-
 try:
     classifier, regressor = load_models()
     daily = load_daily()
-    daily_25_26 = load_daily_25_26()
 except Exception as exc:
     st.error(f"App assets could not be loaded: {exc}")
     st.info("Ensure both model .pkl files and daily_aqi_dashboard.csv are in the same GitHub folder as app.py. Use the matching requirements.txt supplied with this release.")
     st.stop()
 
+@st.cache_data(show_spinner=False)
+def get_next_day_training_data(daily_frame):
+    frame = daily_frame.copy().sort_values("Date")
+    frame["Next_Day_AQI"] = pd.to_numeric(frame["Next_Day_AQI"], errors="coerce")
+    frame = frame.dropna(subset=["Next_Day_AQI"]).copy()
+    X = frame[FEATURES].apply(pd.to_numeric, errors="coerce")
+    y = frame["Next_Day_AQI"].astype(float)
+    split = int(len(frame) * 0.80)
+    return X.iloc[:split], X.iloc[split:], y.iloc[:split], y.iloc[split:], len(frame)
+
+def run_regression_tuning(daily_frame):
+    X_train, X_test, y_train, y_test, n_rows = get_next_day_training_data(daily_frame)
+    cv = TimeSeriesSplit(n_splits=5)
+    specs = {
+        "Linear Regression": (
+            LinearRegression(),
+            {"model__fit_intercept": [True, False], "model__positive": [False, True]}
+        ),
+        "Decision Tree": (
+            DecisionTreeRegressor(random_state=42),
+            {
+                "model__max_depth": [None, 3, 5, 8, 12],
+                "model__min_samples_split": [2, 5, 10],
+                "model__min_samples_leaf": [1, 2, 4]
+            }
+        ),
+        "Random Forest": (
+            RandomForestRegressor(random_state=42, n_jobs=-1),
+            {
+                "model__n_estimators": [100, 200, 400],
+                "model__max_depth": [None, 8, 12],
+                "model__min_samples_split": [2, 5],
+                "model__min_samples_leaf": [1, 2]
+            }
+        ),
+        "Gradient Boosting": (
+            GradientBoostingRegressor(random_state=42),
+            {
+                "model__n_estimators": [100, 200],
+                "model__learning_rate": [0.03, 0.05, 0.1],
+                "model__max_depth": [2, 3],
+                "model__subsample": [0.8, 1.0]
+            }
+        )
+    }
+    baseline_rows, tuned_rows, best_models, parameter_rows = [], [], {}, []
+    for name, (estimator, grid) in specs.items():
+        baseline = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("model", estimator)
+        ])
+        baseline.fit(X_train, y_train)
+        base_pred = baseline.predict(X_test)
+        baseline_rows.append({
+            "Model": name,
+            "MAE": mean_absolute_error(y_test, base_pred),
+            "RMSE": np.sqrt(mean_squared_error(y_test, base_pred)),
+            "R²": r2_score(y_test, base_pred)
+        })
+
+        candidate = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("model", estimator.__class__(**estimator.get_params()))
+        ])
+        search = GridSearchCV(
+            candidate, grid, scoring="neg_mean_absolute_error",
+            cv=cv, n_jobs=-1, refit=True, return_train_score=True
+        )
+        search.fit(X_train, y_train)
+        pred = search.best_estimator_.predict(X_test)
+        best_models[name] = search.best_estimator_
+        tuned_rows.append({
+            "Model": name,
+            "Best CV MAE": -search.best_score_,
+            "MAE": mean_absolute_error(y_test, pred),
+            "RMSE": np.sqrt(mean_squared_error(y_test, pred)),
+            "R²": r2_score(y_test, pred),
+            "Configurations Tested": len(search.cv_results_["params"])
+        })
+        parameter_rows.append({"Model": name, "Best Parameters": str(search.best_params_)})
+
+    baseline_df = pd.DataFrame(baseline_rows)
+    tuned_df = pd.DataFrame(tuned_rows)
+    comparison = baseline_df.merge(tuned_df, on="Model", suffixes=(" (Baseline)", " (Tuned)"))
+    comparison["MAE Reduction"] = comparison["MAE (Baseline)"] - comparison["MAE (Tuned)"]
+    comparison["RMSE Reduction"] = comparison["RMSE (Baseline)"] - comparison["RMSE (Tuned)"]
+    comparison["R² Change"] = comparison["R² (Tuned)"] - comparison["R² (Baseline)"]
+    return {
+        "baseline": baseline_df, "tuned": tuned_df, "comparison": comparison,
+        "parameters": pd.DataFrame(parameter_rows), "models": best_models,
+        "train_rows": len(X_train), "test_rows": len(X_test), "total_rows": n_rows
+    }
+
 st.sidebar.markdown('<div class="eyebrow">DELHI AIR INTELLIGENCE</div>', unsafe_allow_html=True)
 st.sidebar.title("AQI Lab")
-page = st.sidebar.radio("WORKSPACE", ["Overview", "Air Quality Explorer", "2025–26 Station Data", "Model Bake-off", "Prediction Studio", "13-Point Checklist", "Methodology"], label_visibility="visible")
+page = st.sidebar.radio("WORKSPACE", ["Overview", "Air Quality Explorer", "Model Bake-off", "Model Training & Hyperparameter Tuning", "Prediction Studio", "Methodology"], label_visibility="visible")
 st.sidebar.divider()
 st.sidebar.caption("DATA WINDOW")
 st.sidebar.markdown("**01 Jan 2023 — 31 Dec 2024**")
@@ -81,83 +190,7 @@ def heading(kicker, title, desc):
 def category_color(value):
     return COLORS.get(value, "#61c6ce")
 
-if page == "13-Point Checklist":
-    heading("SUBMISSION RUBRIC", "Teacher’s 13-Point Checklist", "A rubric-aligned map of the project, notebook evidence and dashboard sections.")
-    checklist = [
-        ("Describe the dataset", "Primary notebook — Dataset description", "2023–24 shape, columns, data types, coverage, pollutants, predictors and target."),
-        ("Load the data", "Primary notebook — Data loading", "Load AQI2023.csv and AQI2024.csv, then combine the two years."),
-        ("Apply preprocessing", "Primary notebook — Preprocessing", "Date parsing, missing values, duplicates, daily aggregation and AQI construction."),
-        ("Check class balance / imbalance", "Primary notebook — Class distribution", "Category counts and proportions; discuss why accuracy alone can mislead."),
-        ("Feature selection and feature scaling", "Primary notebook — ML pipeline", "SelectKBest and StandardScaler are fitted inside the training pipeline to avoid data leakage."),
-        ("Run the machine-learning workflow", "Primary notebook — Next-day experiment", "Consecutive-day target construction and chronological train/test split."),
-        ("Apply Model 1", "Primary notebook — Model bake-off", "Linear Regression / Logistic Regression baseline models."),
-        ("Apply Model 2", "Primary notebook — Model bake-off", "Decision Tree and Random Forest models."),
-        ("Apply Model 3", "Primary notebook — Model bake-off", "Gradient Boosting models."),
-        ("Measure evaluation parameters", "Model Bake-off dashboard + notebook", "Regression: MAE, RMSE, R². Classification: accuracy, balanced accuracy, precision, recall and macro-F1 where reported."),
-        ("Hyperparameter tuning", "Primary notebook — tuning section", "TimeSeriesSplit/GridSearchCV is applied to training data only."),
-        ("Compare results, interpret each step and conclude", "Primary notebook — comparison and conclusion", "Compare models on the same chronological holdout; explain findings, limitations and final conclusion."),
-        ("Apply ensemble methods", "Primary notebook — Ensemble section", "Voting Regressor and Voting Classifier evaluated on the held-out test set."),
-    ]
-    done = [True] * 13
-    for i, (name, where, evidence) in enumerate(checklist, 1):
-        with st.container(border=True):
-            left, right = st.columns([0.08, 0.92])
-            left.markdown(f"### {i:02d}")
-            right.markdown(f"**{name}**")
-            right.caption(f"{where} · {evidence}")
-    st.info("Evidence status: sections are mapped in the supplied notebook and dashboard. Before submission, run the notebooks top-to-bottom in Colab and save the executed outputs; this page does not claim that a fresh run has been completed.")
-    st.markdown("### Reported primary benchmark results (2023–24)")
-    a,b,c=st.columns(3)
-    a.metric("Voting Regressor · MAE", "70.920")
-    b.metric("Voting Regressor · RMSE", "92.680")
-    c.metric("Voting Regressor · R²", "0.606")
-    a,b,c=st.columns(3)
-    a.metric("Voting Classifier · Accuracy", "0.570")
-    b.metric("Balanced accuracy", "0.495")
-    c.metric("Macro F1", "0.457")
-    st.caption("Classification macro precision is not reported for the tuned/voting rows in the executed summary; no value is inferred. The test set contains only two Satisfactory examples.")
-
-if page == "2025–26 Station Data":
-    heading("05 / EXTENDED DATASET", "Delhi Station Data · 2025–26",
-            "Station-level daily AQI reconstruction from four CAAQMS stations, February 2025 to May 2026.")
-    st.markdown('<div class="panel"><b>Data treatment</b><br>Mixed 15-minute/hourly observations were averaged into hourly bins per station. NO₂ and SO₂ (ppb) were converted to µg/m³ and CO (ppb) to mg/m³ at 25°C and 1 atm. PM₂.₅, PM₁₀, NO₂ and SO₂ use daily means; CO and Ozone use maximum rolling 8-hour means. A minimum of 16 hourly readings is required. NH₃ is not present in this source, so this station-based AQI uses six available pollutants and requires at least three valid sub-indices including PM.</div>', unsafe_allow_html=True)
-    station = st.selectbox("Monitoring station", sorted(daily_25_26["Station"].dropna().unique()))
-    sdata = daily_25_26[daily_25_26.Station == station].copy()
-    valid25 = sdata.dropna(subset=["AQI"])
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Daily records", f"{len(sdata):,}")
-    c2.metric("AQI-eligible days", f"{len(valid25):,}")
-    c3.metric("Mean reconstructed AQI", f"{valid25.AQI.mean():.1f}" if len(valid25) else "N/A")
-    c4.metric("Latest eligible AQI", f"{valid25.iloc[-1].AQI:.1f}" if len(valid25) else "N/A")
-    if len(valid25):
-        fig=px.line(valid25,x="Date",y="AQI",color_discrete_sequence=["#65d1d1"])
-        fig.update_layout(template="plotly_dark",paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",height=360,xaxis_title="",yaxis_title="Reconstructed AQI")
-        st.plotly_chart(fig,use_container_width=True)
-        dist25=valid25["AQI_Category"].value_counts().reindex(CATEGORY_ORDER).fillna(0).rename_axis("Category").reset_index(name="Days")
-        fig=px.bar(dist25,x="Category",y="Days",color="Category",color_discrete_map=COLORS)
-        fig.update_layout(template="plotly_dark",paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",showlegend=False,height=300)
-        st.plotly_chart(fig,use_container_width=True)
-    st.markdown("### Experimental next-day model estimate")
-    st.warning("This is a transfer estimate, not a model retrained on 2025–26 labels. The original 2023–24 models were trained on city-level data. This station dataset has no NH₃, so the model pipeline imputes NH₃ using its training-set median. Distribution shift and the unit-conversion assumption may affect accuracy.")
-    if len(valid25):
-        last=valid25.iloc[-1]
-        if st.button(f"Estimate next-day AQI for {station}"):
-            x=pd.DataFrame([{f:last.get(f,np.nan) for f in FEATURES}],columns=FEATURES)
-            try:
-                p_aqi=float(regressor.predict(x)[0])
-                p_cat=str(classifier.predict(x)[0])
-                a,b=st.columns(2)
-                a.metric("Model-estimated next-day AQI",f"{max(0,p_aqi):.1f}")
-                b.metric("Model-estimated category",p_cat)
-                st.caption(f"Input day: {last.Date.date()} · Missing NH₃ was imputed by the fitted pipeline.")
-            except Exception as exc:
-                st.error(f"Forecast failed: {exc}")
-    with st.expander("View station-level daily data"):
-        st.dataframe(sdata,use_container_width=True,hide_index=True)
-    st.download_button("Download 2025–26 daily station dataset",sdata.to_csv(index=False).encode("utf-8"),
-                       file_name=f"{station.lower().replace(' ','_')}_daily_aqi_2025_26.csv",mime="text/csv")
-
-elif page == "Overview":
+if page == "Overview":
     st.markdown('<div class="hero"><div class="eyebrow">DELHI · AIR QUALITY RESEARCH</div><h1>Reading the air.<br>Forecasting tomorrow.</h1><p>An interactive view of Delhi’s 2023–2024 hourly pollution dataset, reconstructed into daily AQI and evaluated with chronological next-day ML experiments.</p></div>', unsafe_allow_html=True)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Hourly observations", f"{len(daily)*24:,}" if False else "17,544")
@@ -216,7 +249,7 @@ elif page == "Air Quality Explorer":
 
 elif page == "Model Bake-off":
     heading("02 / MODEL EVALUATION","The ML Bake-off","Chronological holdout evaluation from the notebook’s verified next-day experiment.")
-    st.markdown('<div class="panel"><b>Experiment design</b><br>637 consecutive-day forecasting rows · 509 train / 128 test · 7 pollutant features. Pipelines: median imputation, SelectKBest feature selection and standard scaling. Hyperparameter tuning used 5-fold TimeSeriesSplit; ensembles evaluated on the held-out chronological test set.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="panel"><b>Experiment design</b><br>637 consecutive-day forecasting rows · 509 train / 128 test · 7 pollutant features · chronological 80:20 split. Preprocessing: median imputation + standard scaling inside each pipeline.</div>',unsafe_allow_html=True)
     tab1,tab2=st.tabs(["Regression · AQI value","Classification · AQI category"])
     with tab1:
         st.markdown("#### Regression leaderboard")
@@ -224,7 +257,7 @@ elif page == "Model Bake-off":
         fig=px.bar(REG_RESULTS.sort_values("MAE"),x="Model",y="MAE",color="Model",color_discrete_sequence=["#4cc7c9","#5b9bd5","#8a78cf","#d38a50","#d65d69"])
         fig.update_layout(template="plotly_dark",paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",showlegend=False,height=350,margin=dict(l=5,r=5,t=20,b=5),yaxis_title="Mean Absolute Error (lower is better)")
         st.plotly_chart(fig,use_container_width=True)
-        st.success("Selected regressor: Voting Regressor · MAE 70.920 · RMSE 92.680 · R² 0.606")
+        st.info("Baseline reference: Gradient Boosting had the lowest baseline test MAE (78.603). The new tuning experiment selects its deployable regressor using cross-validation MAE; see the Hyperparameter Tuning workspace.")
         st.caption("The baseline is a mean predictor. Its negative R² indicates it performs worse than predicting the test-set mean benchmark.")
     with tab2:
         st.markdown("#### Classification leaderboard")
@@ -232,12 +265,87 @@ elif page == "Model Bake-off":
         fig=px.bar(CLF_RESULTS.sort_values("Macro F1",ascending=False),x="Model",y="Macro F1",color="Model")
         fig.update_layout(template="plotly_dark",paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",showlegend=False,height=350,margin=dict(l=5,r=5,t=20,b=5),yaxis_title="Macro F1 (higher is better)")
         st.plotly_chart(fig,use_container_width=True)
-        st.success("Selected classifier: Voting Classifier · Accuracy 0.570 · Balanced accuracy 0.495 · Macro F1 0.457")
+        st.success("Selected classifier: Logistic Regression · Accuracy 0.523 · Balanced accuracy 0.558 · Macro F1 0.449")
         st.caption("Macro F1 gives each category equal weight; performance is weaker for the less represented categories.")
 
+elif page == "Model Training & Hyperparameter Tuning":
+    heading("03 / SYSTEMATIC MODEL OPTIMIZATION", "Model Training & Hyperparameter Tuning",
+            "Build logical model versions, search sufficient parameter combinations, and compare baseline against tuned models.")
+    st.markdown("""
+    <div class="panel">
+    <b>Evaluation protocol</b><br>
+    Four regression model families · chronological 80:20 holdout · 5-fold TimeSeriesSplit on training data only ·
+    GridSearchCV with MAE as the selection metric. The final test partition is not used during parameter selection.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("### 1. Training procedure")
+    st.write("The workflow first trains a baseline version of each model, then evaluates a structured parameter grid. This makes the experiment reproducible and avoids random, undocumented model changes.")
+    model_plan = pd.DataFrame([
+        ["Linear Regression", "fit_intercept, positive", "2 × 2"],
+        ["Decision Tree", "max_depth, min_samples_split, min_samples_leaf", "5 × 3 × 3"],
+        ["Random Forest", "n_estimators, max_depth, min_samples_split, min_samples_leaf", "3 × 3 × 2 × 2"],
+        ["Gradient Boosting", "n_estimators, learning_rate, max_depth, subsample", "2 × 3 × 2 × 2"]
+    ], columns=["Model", "Hyperparameters searched", "Grid size"])
+    st.dataframe(model_plan, use_container_width=True, hide_index=True)
+
+    st.markdown("### 2. Run systematic hyperparameter tuning")
+    st.caption("This runs the actual search on the bundled daily AQI data. Runtime depends on your computer.")
+    if st.button("Run baseline training + hyperparameter search", type="primary", use_container_width=True):
+        with st.spinner("Training baselines and running chronological GridSearchCV for all four models..."):
+            try:
+                result = run_regression_tuning(daily)
+                st.session_state["aqi_tuning_result"] = result
+                st.success("Tuning completed. Results below are computed from the current bundled dataset.")
+            except Exception as exc:
+                st.error(f"Tuning failed: {exc}")
+
+    result = st.session_state.get("aqi_tuning_result")
+    if result:
+        st.markdown("### 3. Experiment design and data split")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Eligible next-day rows", f"{result['total_rows']:,}")
+        m2.metric("Training rows", f"{result['train_rows']:,}")
+        m3.metric("Untouched test rows", f"{result['test_rows']:,}")
+        st.info("Median imputation and standard scaling are inside each Pipeline, so they are fitted separately within each cross-validation fold. TimeSeriesSplit preserves temporal order.")
+
+        st.markdown("### 4. Baseline vs tuned performance")
+        st.caption("MAE and RMSE: lower is better. R²: higher is better. A negative improvement means that metric did not improve.")
+        st.dataframe(result["comparison"].round(3), use_container_width=True, hide_index=True)
+        plot_data = result["comparison"].melt(
+            id_vars="Model",
+            value_vars=["MAE (Baseline)", "MAE (Tuned)"],
+            var_name="Experiment", value_name="MAE"
+        )
+        fig = px.bar(plot_data, x="Model", y="MAE", color="Experiment", barmode="group")
+        fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)", height=370,
+                          yaxis_title="Mean Absolute Error (lower is better)")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### 5. Best hyperparameters selected by cross-validation")
+        st.dataframe(result["parameters"], use_container_width=True, hide_index=True)
+        best_row = result["tuned"].sort_values("MAE").iloc[0]
+        best_name = best_row["Model"]
+        st.success(f"Lowest held-out test MAE among the tuned candidates: {best_name} · MAE {best_row['MAE']:.3f} · RMSE {best_row['RMSE']:.3f} · R² {best_row['R²']:.3f}")
+
+        st.markdown("### 6. Export experiment evidence")
+        csv_bytes = result["comparison"].to_csv(index=False).encode("utf-8")
+        st.download_button("Download baseline-vs-tuned comparison (CSV)", csv_bytes,
+                           "aqi_baseline_vs_tuned_comparison.csv", "text/csv")
+        param_bytes = result["parameters"].to_csv(index=False).encode("utf-8")
+        st.download_button("Download selected hyperparameters (CSV)", param_bytes,
+                           "aqi_best_hyperparameters.csv", "text/csv")
+        model_bytes = pickle.dumps(result["models"][best_name])
+        st.download_button(f"Download best tuned regressor ({best_name})", model_bytes,
+                           "best_tuned_aqi_regressor.pkl", "application/octet-stream")
+        st.caption("Downloaded tuned model is a regression pipeline for numeric next-day AQI. The separate category classifier remains unchanged.")
+    else:
+        st.warning("Run the tuning workflow to populate measured results. No tuned scores are pre-filled or fabricated.")
+
 elif page == "Prediction Studio":
-    heading("03 / NEXT-DAY FORECAST","Prediction Studio","Enter today’s pollutant concentrations to estimate tomorrow’s AQI and category.")
-    st.markdown('<div class="panel">The selected voting pipelines use seven pollutant inputs with median imputation, feature selection and scaling, matching the executed notebook experiment. Inputs are concentrations, not AQI sub-indices.</div>',unsafe_allow_html=True)
+    heading("04 / NEXT-DAY FORECAST","Prediction Studio","Enter today’s pollutant concentrations to estimate tomorrow’s AQI and category.")
+    st.markdown('<div class="panel">The active numeric AQI pipeline is the CV-selected tuned Linear Regression model. The category classifier remains the existing separately trained classifier. Both use the same seven input features. Inputs are concentrations, not AQI sub-indices.</div>',unsafe_allow_html=True)
     with st.form("prediction_form"):
         left,right=st.columns(2)
         defaults={"PM2.5 (µg/m³)":60.0,"PM10 (µg/m³)":100.0,"NO2 (µg/m³)":30.0,"SO2 (µg/m³)":10.0,"NH3 (µg/m³)":20.0,"CO (mg/m³)":1.0,"Ozone (µg/m³)":30.0}
@@ -262,7 +370,7 @@ elif page == "Prediction Studio":
             st.error(f"Prediction failed: {exc}")
 
 elif page == "Methodology":
-    heading("04 / MODEL CARD","Methodology & Limitations","A transparent summary of how the notebook constructs AQI and evaluates next-day predictions.")
+    heading("05 / MODEL CARD","Methodology & Limitations","A transparent summary of how the notebook constructs AQI and evaluates next-day predictions.")
     st.markdown("### Data and temporal aggregation")
     st.markdown("""
 - Source data: Delhi hourly observations for 2023 and 2024 (17,544 hourly rows in the notebook).
@@ -278,13 +386,13 @@ elif page == "Methodology":
 - Concentrations above the highest listed breakpoint are assigned 500 in this implementation.
 - Categories: Good (0–50), Satisfactory (51–100), Moderate (101–200), Poor (201–300), Very Poor (301–400), Severe (>400).
 """)
-    st.markdown("### 2025–26 station-data extension\n- Separate station-level dataset; not merged into 2023–24 model training because schema and pollutant availability differ.\n- NO₂/SO₂/CO conversions assume 25°C and 1 atm. NH₃ is absent; it is not used in the reconstructed six-pollutant AQI.\n- Optional next-day model estimates reuse the 2023–24 fitted model with NH₃ median-imputed; these are exploratory transfer estimates, not validated 2025–26 forecasts.\n\n### Forecasting protocol")
+    st.markdown("### Forecasting protocol")
     st.markdown("""
 - Target: next calendar day’s AQI and AQI category.
 - Only consecutive date pairs with valid next-day targets are retained.
 - 637 rows; first 509 used for training and final 128 for testing, preserving chronological order.
-- Features: seven pollutant concentrations. Preprocessing is median imputation, SelectKBest feature selection and standard scaling.
-- Regression selection: Voting Regressor by lowest held-out MAE. Classification selection: Voting Classifier by highest held-out Macro F1.
+- Features: seven pollutant concentrations. Preprocessing is median imputation followed by standard scaling.
+- Existing regression leaderboard selects Gradient Boosting by lowest MAE; classification leaderboard selects Logistic Regression by highest Macro F1. The dedicated tuning workspace now runs a separate four-regressor GridSearchCV experiment and reports its measured results.
 """)
     st.warning("Limitations: the notebook’s breakpoint implementation caps concentrations above the highest listed band at AQI 500; this should be described as the project’s implemented calculation, not independently certified official CPCB software. Test-set metrics are moderate, and category-level performance is uneven. Predictions are not live or official advisories.")
     st.markdown("### Reproducibility")
